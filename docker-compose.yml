@@ -1,0 +1,124 @@
+version: '3.8'
+
+services:
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: localstack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3,sqs
+      - AWS_DEFAULT_REGION=${AWS_REGION:-us-east-1}
+      - LOCALSTACK_HOST=localstack
+    volumes:
+      - localstack_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:4566/_localstack/health | grep -q '\"s3\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  aws-init:
+    image: amazon/aws-cli:latest
+    container_name: aws-init
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=${AWS_REGION:-us-east-1}
+      - S3_BUCKET_RAW=${S3_BUCKET_RAW:-raw-images-localdev}
+      - S3_BUCKET_PROCESSED=${S3_BUCKET_PROCESSED:-processed-images-localdev}
+      - SQS_MAIN_QUEUE=${SQS_MAIN_QUEUE:-image-processing-queue-localdev}
+      - SQS_DLQ=${SQS_DLQ:-image-processing-dlq-localdev}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        ENDPOINT="http://localstack:4566"
+        AWS_CMD="aws --endpoint-url=$$ENDPOINT --region=$$AWS_DEFAULT_REGION"
+
+        echo "Creating S3 buckets..."
+        $$AWS_CMD s3 mb s3://$$S3_BUCKET_RAW 2>/dev/null || echo "$$S3_BUCKET_RAW already exists"
+        $$AWS_CMD s3 mb s3://$$S3_BUCKET_PROCESSED 2>/dev/null || echo "$$S3_BUCKET_PROCESSED already exists"
+
+        echo "Creating Dead-Letter Queue..."
+        $$AWS_CMD sqs create-queue \
+          --queue-name $$SQS_DLQ \
+          --attributes '{"MessageRetentionPeriod":"1209600"}' 2>/dev/null || echo "$$SQS_DLQ already exists"
+
+        DLQ_ARN=$$($$AWS_CMD sqs get-queue-attributes \
+          --queue-url "$$ENDPOINT/000000000000/$$SQS_DLQ" \
+          --attribute-names QueueArn \
+          --query 'Attributes.QueueArn' \
+          --output text)
+
+        echo "DLQ ARN: $$DLQ_ARN"
+
+        echo "Creating main processing queue..."
+        $$AWS_CMD sqs create-queue \
+          --queue-name $$SQS_MAIN_QUEUE \
+          --attributes "{\"VisibilityTimeout\":\"60\",\"MessageRetentionPeriod\":\"86400\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"$$DLQ_ARN\\\",\\\"maxReceiveCount\\\":\\\"3\\\"}\"}" \
+          2>/dev/null || echo "$$SQS_MAIN_QUEUE already exists"
+
+        echo "All AWS resources initialized."
+        echo "  Buckets : $$S3_BUCKET_RAW, $$S3_BUCKET_PROCESSED"
+        echo "  Queue   : $$SQS_MAIN_QUEUE"
+        echo "  DLQ     : $$SQS_DLQ"
+
+  api:
+    build:
+      context: ./api-service
+      dockerfile: Dockerfile
+    container_name: api
+    ports:
+      - "5000:5000"
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - S3_BUCKET_RAW=${S3_BUCKET_RAW:-raw-images-localdev}
+      - S3_BUCKET_PROCESSED=${S3_BUCKET_PROCESSED:-processed-images-localdev}
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL:-http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/image-processing-queue-localdev}
+      - PRESIGNED_URL_EXPIRY_SECONDS=${PRESIGNED_URL_EXPIRY_SECONDS:-3600}
+    depends_on:
+      localstack:
+        condition: service_healthy
+      aws-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build:
+      context: ./worker-service
+      dockerfile: Dockerfile
+    container_name: worker
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - S3_BUCKET_RAW=${S3_BUCKET_RAW:-raw-images-localdev}
+      - S3_BUCKET_PROCESSED=${S3_BUCKET_PROCESSED:-processed-images-localdev}
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL:-http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/image-processing-queue-localdev}
+      - SQS_WAIT_TIME_SECONDS=${SQS_WAIT_TIME_SECONDS:-20}
+      - SQS_MAX_MESSAGES=${SQS_MAX_MESSAGES:-10}
+      - SQS_VISIBILITY_TIMEOUT=${SQS_VISIBILITY_TIMEOUT:-60}
+      - MAX_RETRIES=${MAX_RETRIES:-3}
+      - RETRY_BASE_DELAY=${RETRY_BASE_DELAY:-1.0}
+    depends_on:
+      localstack:
+        condition: service_healthy
+      aws-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  localstack_data:
